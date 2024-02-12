@@ -1,0 +1,95 @@
+-- for signup_user
+CREATE TYPE signup_result AS
+(
+    new_user_id   int,
+    new_sent_code varchar(64)
+);
+
+
+-- for get_sent_code
+CREATE TYPE get_sent_code_result AS
+(
+    user_id   int,
+    code      varchar(64),
+    code_type varchar(64),
+    email     varchar(128)
+);
+
+
+-- for get_user_info, get_session
+CREATE TYPE get_user_info_result AS
+(
+    user_id            int,
+    name               varchar(512),
+    email              varchar(128),
+    status             userstatus,
+    is_email_confirmed bool,
+    curr_agreement_id  int,
+    max_agreement_id   int,
+    points             int,
+    rank_id            int,
+    rank_name          varchar(128)
+);
+
+
+CREATE TYPE login_user_result AS
+(
+    user_id            int,
+    name               varchar(512),
+    email              varchar(128),
+    status             userstatus,
+    is_email_confirmed bool,
+    curr_agreement_id  int,
+    max_agreement_id   int,
+    points             int,
+    rank_id            int,
+    rank_name          varchar(128),
+    token   varchar(64)
+);
+
+-- for save_media
+CREATE TYPE save_media_result AS
+(
+    media_id int,
+    uuid uuid,
+    file_name varchar(256),
+    file_size int,
+    mime_type varchar(128),
+    created_by_usr int
+);
+
+CREATE TYPE get_question_result AS
+    (
+    id int,
+    title varchar(512),
+    text text,
+    user_id int,
+    created_at timestamp,
+    subject_id    int,
+    subject_name  varchar(100),
+    tags_ids      int[],
+    tags_titles   varchar(128)[],
+    has_media     bool
+);
+
+CREATE TYPE get_answer_result AS
+    (
+    id int,
+    user_id int,
+    question_id int,
+    created_at timestamp,
+    marked_as_correct bool,
+    marked_as_correct_at timestamp,
+    text text,
+    has_media bool
+);
+
+CREATE TYPE get_comment_result AS
+    (
+    id int,
+    user_id int,
+    reply_to_answer_id int,
+    reply_to_comment_id int,
+    created_at timestamp,
+    text text
+);

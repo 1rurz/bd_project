@@ -1,0 +1,1177 @@
+-- request code
+CREATE OR REPLACE FUNCTION request_code(
+    for_user_id int,
+    for_email varchar(128),
+    purpose codetype
+)
+    RETURNS varchar(64) -- sent_code
+AS
+$$
+DECLARE
+    new_sent_code varchar(64);
+BEGIN
+    -- Generate sent_code (replace this with your own logic)
+    new_sent_code := encode(gen_random_bytes(32), 'hex');
+
+    -- Insert into sent_codes
+    INSERT INTO sent_codes(user_id, code, code_type, ttl, email)
+    VALUES (for_user_id, new_sent_code, purpose, 600, for_email);
+
+    -- Return newly created sent_code
+
+    RETURN new_sent_code;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- create user, create sent_codes entry, return new user and sent_code
+CREATE OR REPLACE FUNCTION signup_user(
+    reg_name varchar(128),
+    reg_email varchar(128),
+    reg_password_hash char(60),
+    reg_agreement_id int
+)
+    RETURNS signup_result
+AS
+$$
+DECLARE
+    new_user_id   int;
+    new_sent_code varchar(64);
+BEGIN
+    -- Check if email already exists
+    IF EXISTS (SELECT 1 FROM users WHERE email = reg_email) THEN
+        RAISE EXCEPTION 'User with email % already exists. ERR_EMAIL_ALREADY_TAKEN', reg_email;
+    END IF;
+
+    -- Insert into users and get new user ID
+    INSERT INTO users(name, email, password_hash, agreement_id)
+    VALUES (reg_name, reg_email, reg_password_hash, reg_agreement_id)
+    RETURNING id INTO new_user_id;
+
+    new_sent_code := request_code(new_user_id, reg_email, 'email-confirm');
+
+    RETURN (new_user_id, new_sent_code)::signup_result;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION get_user_by_email(
+    for_email varchar(128)
+)
+    RETURNS get_user_info_result
+AS
+$$
+DECLARE
+    user_id int;
+BEGIN
+    -- check if user exists
+    IF NOT EXISTS (SELECT 1 FROM users WHERE email = for_email) THEN
+        RAISE EXCEPTION 'User with email % does not exist. ERR_USER_DOES_NOT_EXIST', for_email;
+    END IF;
+
+    SELECT id FROM users WHERE email = for_email INTO user_id;
+
+    RETURN get_user_info(user_id);
+end;
+$$ LANGUAGE plpgsql;
+
+-- bancheck
+CREATE OR REPLACE FUNCTION is_banned(
+    user_id int
+)
+    RETURNS bool
+AS
+$$
+BEGIN
+    return EXISTS(SELECT 1 FROM users WHERE id = user_id AND status = 'banned');
+END;
+$$ LANGUAGE plpgsql;
+
+-- get sent_code and mark as used
+CREATE OR REPLACE FUNCTION get_sent_code(
+    for_code varchar(64)
+)
+    RETURNS get_sent_code_result
+AS
+$$
+DECLARE
+    user_id   int;
+    code_type varchar(64);
+    email     varchar(128);
+BEGIN
+    -- check if code exists
+    IF NOT EXISTS (SELECT 1 FROM sent_codes WHERE sent_codes.code = for_code AND executed = false) THEN
+        RAISE EXCEPTION 'Code % does not exist or already used. ERR_CODE_DOESNT_EXIST_OR_USED', for_code;
+    END IF;
+
+    -- check if created_at + ttl(seconds) is not expired
+    IF EXISTS (SELECT 1 FROM sent_codes WHERE code = for_code AND created_at + ttl * interval '1 second' < now()) THEN
+        RAISE EXCEPTION 'Code % is expired. ERR_CODE_EXPIRED', for_code;
+    END IF;
+
+    -- get sent_code
+    SELECT sent_codes.user_id, sent_codes.code_type, sent_codes.email
+    FROM sent_codes
+    WHERE sent_codes.code = for_code
+    INTO user_id, code_type, email;
+
+    -- mark as used
+    UPDATE sent_codes
+    SET executed = true
+    WHERE code = for_code;
+
+    RETURN (user_id, for_code, code_type, email)::get_sent_code_result;
+end;
+$$ LANGUAGE plpgsql;
+
+
+-- mark user as confirmed, return nothing
+CREATE OR REPLACE FUNCTION mark_user_as_confirmed(
+    for_user_id int
+)
+    RETURNS VOID
+AS
+$$
+BEGIN
+    -- check if user exists
+    IF NOT EXISTS (SELECT 1 FROM users WHERE id = for_user_id) THEN
+        RAISE EXCEPTION 'User with id % does not exist. ERR_USER_DOES_NOT_EXIST', for_user_id;
+    END IF;
+
+    -- mark user as confirmed
+    UPDATE users
+    SET is_email_confirmed = true,
+        status             = 'confirmed'
+    WHERE id = for_user_id;
+
+    RETURN;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- validate login&password, return user_id or null
+CREATE OR REPLACE FUNCTION login_user(
+    login_email varchar(128),
+    login_password_hash char(60)
+)
+    RETURNS int
+AS
+$$
+DECLARE
+    user_id int;
+BEGIN
+    if is_banned(user_id) then
+        RAISE EXCEPTION 'User with id % is banned. ERR_USER_BANNED', user_id;
+    end if;
+
+    -- Check if email already exists
+    IF EXISTS (SELECT 1 FROM users WHERE email = login_email AND password_hash = login_password_hash) THEN
+        user_id := (SELECT id FROM users WHERE email = login_email AND password_hash = login_password_hash);
+    ELSE
+        user_id := NULL;
+    END IF;
+
+    RETURN user_id;
+END
+$$ LANGUAGE plpgsql;
+
+
+-- change password, return nothing
+CREATE OR REPLACE FUNCTION change_password(
+    for_user_id int,
+    new_password_hash char(60)
+)
+    RETURNS VOID
+AS
+$$
+BEGIN
+    -- check if user exists
+    IF NOT EXISTS (SELECT 1 FROM users WHERE id = for_user_id) THEN
+        RAISE EXCEPTION 'User with id % does not exist. ERR_USER_DOES_NOT_EXIST', for_user_id;
+    END IF;
+
+    -- change password
+    UPDATE users
+    SET password_hash = new_password_hash
+    WHERE id = for_user_id;
+
+    RETURN;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- change name, return nothing
+CREATE OR REPLACE FUNCTION change_name(
+    for_user_id int,
+    new_name varchar(512)
+)
+    RETURNS VOID
+AS
+$$
+BEGIN
+    -- check if user exists
+    IF NOT EXISTS (SELECT 1 FROM users WHERE id = for_user_id) THEN
+        RAISE EXCEPTION 'User with id % does not exist. ERR_USER_DOES_NOT_EXIST', for_user_id;
+    END IF;
+
+    -- change password
+    UPDATE users
+    SET name = new_name
+    WHERE id = for_user_id;
+
+    RETURN;
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+-- create session, return session_id
+CREATE OR REPLACE FUNCTION create_session(
+    for_user_id int
+)
+    RETURNS char(64) -- session_id
+AS
+$$
+DECLARE
+    new_session_token char(64);
+BEGIN
+    if is_banned(for_user_id) then
+        RAISE EXCEPTION 'User with id % is banned. ERR_USER_BANNED', for_user_id;
+    end if;
+
+    -- Generate session_id (replace this with your own logic)
+    new_session_token := encode(gen_random_bytes(32), 'hex');
+
+    -- Insert into sessions
+    INSERT INTO user_sessions(user_id, token)
+    VALUES (for_user_id, new_session_token);
+
+    -- Return newly created session_id
+    RETURN new_session_token;
+END;
+$$ LANGUAGE plpgsql;
+
+-- login + create session
+CREATE OR REPLACE FUNCTION login_with_session_create(
+    login_email varchar(128),
+    login_password_hash char(60)
+)
+    RETURNS login_user_result
+AS
+$$
+DECLARE
+    user_id       int;
+    session_token char(64);
+    user_info     get_user_info_result;
+BEGIN
+    user_id := login_user(login_email, login_password_hash);
+    if user_id is null then
+        RAISE EXCEPTION 'Wrong login or password. ERR_INCORRECT_CREDENTIALS';
+    end if;
+    user_info := get_user_info(user_id);
+    session_token := create_session(user_id);
+
+    RETURN (user_info.user_id, user_info.name, user_info.email, user_info.status, user_info.is_email_confirmed,
+            user_info.curr_agreement_id, user_info.max_agreement_id, user_info.points, user_info.rank_id,
+            user_info.rank_name, session_token)::login_user_result;
+end;
+$$ LANGUAGE plpgsql;
+
+-- get session
+CREATE OR REPLACE FUNCTION get_session(
+    for_session_token char(64)
+)
+    RETURNS get_user_info_result
+AS
+$$
+DECLARE
+    user_id int;
+BEGIN
+    -- check if session exists
+    IF NOT EXISTS (SELECT 1 FROM user_sessions WHERE token = for_session_token) THEN
+        RAISE EXCEPTION 'Session % does not exist. ERR_SESSION_DOES_NOT_EXIST', for_session_token;
+    END IF;
+
+    -- check if created_at + ttl(seconds) is not expired
+    IF EXISTS (SELECT 1
+               FROM user_sessions
+               WHERE token = for_session_token
+                 AND last_access + interval '7 days' < now()) THEN
+        DELETE FROM user_sessions WHERE token = for_session_token;
+        RAISE EXCEPTION 'Session % is expired. ERR_SESSION_EXPIRED', for_session_token;
+    END IF;
+
+    -- get user_id
+    UPDATE user_sessions SET last_access = now() WHERE token = for_session_token;
+
+    SELECT user_sessions.user_id FROM user_sessions WHERE token = for_session_token INTO user_id;
+
+    RETURN get_user_info(user_id);
+end;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION drop_all_user_sessions(
+    to_del_user_id int
+)
+    RETURNS VOID
+AS
+$$
+BEGIN
+    DELETE FROM user_sessions where user_id = to_del_user_id;
+end;
+$$ LANGUAGE plpgsql;
+
+
+-- unauth session
+CREATE OR REPLACE FUNCTION unauth_session(
+    session_token char(64)
+)
+    RETURNS VOID
+AS
+$$
+BEGIN
+    DELETE FROM user_sessions WHERE token = session_token;
+    RETURN;
+END;
+$$ LANGUAGE plpgsql;
+
+-- set_user_status
+CREATE OR REPLACE FUNCTION set_user_status(
+    for_user_id int,
+    new_status userstatus
+)
+    RETURNS VOID
+AS
+$$
+BEGIN
+    -- check if user exists
+    IF NOT EXISTS (SELECT 1 FROM users WHERE id = for_user_id) THEN
+        RAISE EXCEPTION 'User with id % does not exist. ERR_USER_DOES_NOT_EXIST', for_user_id;
+    END IF;
+
+    -- change status
+    UPDATE users
+    SET status = new_status
+    WHERE id = for_user_id;
+
+    RETURN;
+END
+$$ LANGUAGE plpgsql;
+
+
+-- get user info and his rank by points (or '' if there is no rank)
+CREATE OR REPLACE FUNCTION get_user_info(
+    for_user_id int
+)
+    RETURNS get_user_info_result
+AS
+$$
+DECLARE
+    user_id            int;
+    name               varchar(512);
+    email              varchar(128);
+    status             userstatus;
+    is_email_confirmed bool;
+    curr_agreement_id  int;
+    max_agreement_id   int;
+    points             int;
+    rank_id            int;
+    rank_name          varchar(128);
+BEGIN
+    -- check if user exists
+    IF NOT EXISTS (SELECT 1 FROM users WHERE id = for_user_id) THEN
+        RAISE EXCEPTION 'User with id % does not exist. ERR_USER_DOES_NOT_EXIST', for_user_id;
+    END IF;
+
+
+    SELECT u.id,
+           u.name,
+           u.email,
+           u.status,
+           u.is_email_confirmed,
+           u.agreement_id,
+           u.points,
+           r.rank_id,
+           r.rank_name
+    FROM users u
+             LEFT JOIN ranks r ON u.points >= r.min_points
+    WHERE u.id = for_user_id
+    INTO user_id, name, email, status, is_email_confirmed, curr_agreement_id, points, rank_id,
+        rank_name;
+
+    SELECT max(agreements.agreement_id) FROM agreements INTO max_agreement_id;
+
+    RETURN (user_id, name, email, status, is_email_confirmed, curr_agreement_id, max_agreement_id, points, rank_id,
+            rank_name)::get_user_info_result;
+end;
+$$ LANGUAGE plpgsql;
+
+---- media
+CREATE OR REPLACE FUNCTION save_media(
+    new_file_name varchar(256),
+    new_mime_type varchar(128),
+    new_file_size int,
+    created_by_usr int
+)
+    RETURNS save_media_result
+AS
+$$
+DECLARE
+    new_id   int;
+    new_uuid uuid;
+BEGIN
+    new_uuid = gen_random_uuid();
+    INSERT INTO media(media_uuid, file_name, file_size, mime_type, created_by)
+    VALUES (new_uuid, new_file_name, new_file_size, new_mime_type, created_by_usr)
+    RETURNING media_id INTO new_id;
+
+    RETURN (new_id, new_uuid, new_file_name, new_file_size, new_mime_type, created_by_usr)::save_media_result;
+end;
+$$ language plpgsql;
+
+-- create tag if not exists
+CREATE OR REPLACE FUNCTION mb_create_tag(
+    new_tag varchar(128)
+)
+    RETURNS int
+AS
+$$
+DECLARE
+    v_tag_id int;
+BEGIN
+    -- Check if tag already exists
+    SELECT tag_id INTO v_tag_id FROM tags WHERE tag = new_tag;
+
+    -- If not, create it
+    IF v_tag_id IS NULL THEN
+        INSERT INTO tags (tag) VALUES (new_tag) RETURNING tag_id INTO v_tag_id;
+    END IF;
+
+    RETURN v_tag_id;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION edit_tag(
+    edit_tag_id int,
+    new_tag varchar(128)
+)
+    RETURNS VOID
+AS
+$$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM tags WHERE tag_id = edit_tag_id) THEN
+        RAISE EXCEPTION 'Tag with id % does not exist. ERR_TAG_DOES_NOT_EXIST', edit_tag_id;
+    end if;
+
+    UPDATE tags SET tag = new_tag WHERE tag_id = edit_tag_id;
+end;
+$$ LANGUAGE plpgsql;
+
+--- questions
+CREATE OR REPLACE FUNCTION create_question(
+    new_title varchar(512),
+    new_text text,
+    new_created_by int,
+    new_subject_id int,
+    new_tags varchar(128)[],
+    new_media_ids int[]
+)
+    RETURNS get_question_result
+AS
+$$
+DECLARE
+    v_tag_id            int;
+    new_tag             varchar(128);
+    media_id            int;
+    created_question_id int;
+BEGIN
+    -- Insert the new question and get its ID
+    INSERT INTO questions as q (title, text, user_id, subject_id)
+    VALUES (new_title, new_text, new_created_by, new_subject_id)
+    RETURNING q.question_id INTO created_question_id;
+
+    -- Insert tags and build tags array
+    FOREACH new_tag IN ARRAY new_tags
+        LOOP
+            SELECT mb_create_tag(new_tag) INTO v_tag_id;
+            -- Link the tag to the question
+            INSERT INTO question_tags (question, tag) VALUES (created_question_id, v_tag_id);
+        END LOOP;
+
+    -- Link the media to the question
+    FOREACH media_id IN ARRAY new_media_ids
+        LOOP
+            INSERT INTO question_pictures (media_id, question) VALUES (media_id, created_question_id);
+        END LOOP;
+
+    -- Return all relevant fields
+    RETURN get_question(created_question_id);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION get_question_media(
+    for_question_id int
+)
+    RETURNS TABLE
+            (
+                media_id   int,
+                media_uuid uuid,
+                file_name  varchar(256),
+                file_size  int,
+                mime_type  varchar(128)
+            )
+AS
+$$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM questions WHERE question_id = for_question_id) THEN
+        RAISE EXCEPTION 'Question with id % does not exist. ERR_QUESTION_DOES_NOT_EXIST', for_question_id;
+    END IF;
+    RETURN QUERY
+        SELECT m.media_id, m.media_uuid, m.file_name, m.file_size, m.mime_type
+        FROM media m
+                 JOIN question_pictures qp ON m.media_id = qp.media_id
+        WHERE qp.question = for_question_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- get question
+CREATE OR REPLACE FUNCTION get_question(
+    for_question_id int
+)
+    RETURNS get_question_result
+AS
+$$
+DECLARE
+    v_tag_id      int;
+    v_tag         varchar(128);
+    v_tags_ids    int[]          := '{}';
+    v_tags_titles varchar(128)[] := '{}';
+    v_has_media   bool           := false;
+    _question_id  int;
+    _title        varchar(512);
+    _text         text;
+    _user_id      int;
+    _created_at   timestamp;
+    _subject_id   int;
+    _subject_name varchar(100);
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM questions WHERE question_id = for_question_id) THEN
+        RAISE EXCEPTION 'Question with id % does not exist. ERR_QUESTION_DOES_NOT_EXIST', for_question_id;
+    END IF;
+    -- Get basic question and subject details
+    SELECT q.question_id, q.title, q.text, q.user_id, q.created_at, q.subject_id, s.subject
+    INTO _question_id, _title, _text, _user_id, _created_at, _subject_id, _subject_name
+    FROM questions q
+             JOIN subjects s ON q.subject_id = s.subject_id
+    WHERE q.question_id = for_question_id;
+
+    -- Get tags for the question
+    FOR v_tag_id, v_tag IN
+        SELECT t.tag_id, t.tag
+        FROM question_tags qt
+                 JOIN tags t ON qt.tag = t.tag_id
+        WHERE qt.question = for_question_id
+        LOOP
+            v_tags_ids := array_append(v_tags_ids, v_tag_id);
+            v_tags_titles := array_append(v_tags_titles, v_tag);
+        END LOOP;
+
+
+    -- Check if question has media
+    SELECT EXISTS(SELECT 1
+                  FROM question_pictures
+                  WHERE question = for_question_id)
+    INTO v_has_media;
+
+    RETURN (_question_id, _title, _text, _user_id, _created_at, _subject_id, _subject_name, v_tags_ids, v_tags_titles,
+            v_has_media)::get_question_result;
+
+END;
+$$ LANGUAGE plpgsql;
+
+-- delete question
+CREATE OR REPLACE FUNCTION delete_question(
+    for_question_id int
+)
+    RETURNS VOID
+AS
+$$
+BEGIN
+    -- check if question exists
+    IF NOT EXISTS (SELECT 1 FROM questions WHERE question_id = for_question_id) THEN
+        RAISE EXCEPTION 'Question with id % does not exist. ERR_QUESTION_DOES_NOT_EXIST', for_question_id;
+    END IF;
+
+    -- delete question
+    DELETE FROM questions WHERE question_id = for_question_id;
+
+    RETURN;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION edit_question(
+    edit_question_id int,
+    new_title varchar(512),
+    new_text text,
+    new_subject_id int,
+    new_tags varchar(128)[],
+    new_media_ids int[]
+)
+    RETURNS get_question_result
+AS
+$$
+DECLARE
+    v_tag_id int;
+    new_tag  varchar(128);
+    _media_id int;
+BEGIN
+    -- Check if question exists
+    IF NOT EXISTS (SELECT 1 FROM questions WHERE question_id = edit_question_id) THEN
+        RAISE EXCEPTION 'Question with id % does not exist. ERR_QUESTION_DOES_NOT_EXIST', edit_question_id;
+    END IF;
+
+    -- Update the questions table
+    UPDATE questions
+    SET title      = COALESCE(new_title, title),
+        text       = COALESCE(new_text, text),
+        subject_id = COALESCE(new_subject_id, subject_id)
+    WHERE question_id = edit_question_id;
+
+    IF new_tags IS NOT NULL THEN
+        -- First, delete existing tags for the question
+        DELETE FROM question_tags WHERE question = edit_question_id;
+
+        -- Then, insert new tags
+        FOREACH new_tag IN ARRAY new_tags
+            LOOP
+                SELECT mb_create_tag(new_tag) INTO v_tag_id;
+
+                -- Link the tag to the question
+                INSERT INTO question_tags (question, tag) VALUES (edit_question_id, v_tag_id);
+            END LOOP;
+    END IF;
+
+    IF new_media_ids IS NOT NULL THEN
+        -- First, delete existing media for the question
+        DELETE FROM question_pictures WHERE question = edit_question_id;
+
+        -- Then, insert new media
+        FOREACH _media_id IN ARRAY new_media_ids
+            LOOP
+                IF NOT EXISTS(SELECT 1 FROM media WHERE media_id = _media_id) THEN
+                    RAISE EXCEPTION 'Media with id % does not exist. ERR_MEDIA_DOES_NOT_EXIST', _media_id;
+                END IF;
+                INSERT INTO question_pictures (media_id, question) VALUES (_media_id, edit_question_id);
+            END LOOP;
+    END IF;
+    RETURN get_question(edit_question_id);
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+CREATE OR REPLACE FUNCTION search_question(
+    title_search varchar(512),
+    subject_id_search int,
+    tag_search varchar(128),
+    page_num int,
+    page_size int,
+    is_asc bool,
+    order_by int
+)
+    RETURNS SETOF get_question_result
+AS
+$$
+DECLARE
+    tag_search_id int;
+BEGIN
+    IF order_by > 2 THEN
+        RAISE EXCEPTION 'Unknown order by. ERR_ORDER_BY_OUT_OF_BOUNDS';
+    end if;
+
+    IF tag_search IS NOT NULL THEN
+        SELECT tag_id INTO tag_search_id FROM tags WHERE tag = tag_search;
+        IF tag_search_id IS NULL THEN
+            RAISE EXCEPTION 'Tag %s was not found. ERR_FILTER_TAG_NOT_FOUND', tag_search;
+        END IF;
+    end if;
+
+    RETURN QUERY SELECT gqr.*
+                 FROM questions q
+                          JOIN LATERAL get_question(q.question_id) AS gqr ON true
+                 WHERE (title_search IS NULL or (
+                         to_tsvector('russian', q.title) @@ websearch_to_tsquery('russian', title_search)
+                     ))
+                   AND COALESCE(subject_id_search, q.subject_id) = q.subject_id
+                   AND (tag_search IS NULL OR EXISTS(SELECT 1
+                                                     FROM question_tags qt
+                                                     WHERE qt.question = q.question_id
+                                                       AND qt.tag = tag_search_id))
+                 ORDER BY CASE WHEN order_by = 0 AND is_asc THEN q.question_id END,
+                          CASE WHEN order_by = 0 AND NOT is_asc THEN q.question_id END DESC,
+                          CASE WHEN order_by = 1 AND is_asc THEN q.created_at END,
+                          CASE WHEN order_by = 1 AND NOT is_asc THEN q.created_at END DESC,
+                          CASE WHEN order_by = 2 AND is_asc THEN q.title END,
+                          CASE WHEN order_by = 2 AND NOT is_asc THEN q.title END DESC
+                 LIMIT page_size OFFSET page_num * page_size;
+end;
+$$ LANGUAGE plpgsql;
+
+-- get answer media
+CREATE OR REPLACE FUNCTION get_answer_media(
+    for_answer_id int
+)
+    RETURNS TABLE
+            (
+                media_id   int,
+                media_uuid uuid,
+                file_name  varchar(256),
+                file_size  int,
+                mime_type  varchar(128)
+            )
+AS
+$$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM answers WHERE response_id = for_answer_id) THEN
+        RAISE EXCEPTION 'Answer with id % does not exist. ERR_ANSWER_DOES_NOT_EXIST', for_answer_id;
+    END IF;
+    RETURN QUERY
+        SELECT m.media_id, m.media_uuid, m.file_name, m.file_size, m.mime_type
+        FROM media m
+                 JOIN answers_pictures ap ON m.media_id = ap.media_id
+        WHERE ap.response = for_answer_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- get answer
+CREATE OR REPLACE FUNCTION get_answer(
+    for_answer_id int
+)
+    RETURNS get_answer_result
+AS
+$$
+DECLARE
+    _response_id          int;
+    _user_id              int;
+    _question             int;
+    _created_at           timestamp;
+    _marked_as_correct    bool;
+    _marked_as_correct_at timestamp;
+    _text                 text;
+    _has_media            bool;
+BEGIN
+    -- check if answer exists
+    IF NOT EXISTS (SELECT 1 FROM answers WHERE response_id = for_answer_id) THEN
+        RAISE EXCEPTION 'Answer with id % does not exist. ERR_ANSWER_DOES_NOT_EXIST', for_answer_id;
+    END IF;
+
+    SELECT a.response_id, a.user_id, a.question, a.created_at, a.marked_as_correct, a.marked_as_correct_at, a.text
+    INTO _response_id, _user_id, _question, _created_at, _marked_as_correct, _marked_as_correct_at, _text
+    FROM answers a
+    WHERE a.response_id = for_answer_id;
+
+    SELECT EXISTS(SELECT 1
+                  FROM answers_pictures
+                  WHERE response = for_answer_id)
+    INTO _has_media;
+
+    RETURN (_response_id, _user_id, _question, _created_at, _marked_as_correct, _marked_as_correct_at, _text,
+            _has_media)::get_answer_result;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION create_answer(
+    for_question_id int,
+    new_text text,
+    new_created_by int,
+    new_media_ids int[]
+)
+    RETURNS get_answer_result
+AS
+$$
+DECLARE
+    _media_id int;
+BEGIN
+    -- check if question exists
+    IF NOT EXISTS (SELECT 1 FROM questions WHERE question_id = for_question_id) THEN
+        RAISE EXCEPTION 'Question with id % does not exist. ERR_QUESTION_DOES_NOT_EXIST', for_question_id;
+    END IF;
+
+    -- Insert the new answer and get its ID
+    INSERT INTO answers as a (question, user_id, text)
+    VALUES (for_question_id, new_created_by, new_text)
+    RETURNING a.response_id INTO for_question_id;
+
+    -- Link the media to the answer
+    FOREACH _media_id IN ARRAY new_media_ids
+        LOOP
+            IF NOT EXISTS(SELECT 1 FROM media WHERE media_id = _media_id) THEN
+                RAISE EXCEPTION 'Media with id % does not exist. ERR_MEDIA_DOES_NOT_EXIST', _media_id;
+            END IF;
+            INSERT INTO answers_pictures (media_id, response) VALUES (_media_id, for_question_id);
+        END LOOP;
+
+    -- Return all relevant fields
+    RETURN get_answer(for_question_id);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION set_correct_mark(
+    for_answer_id int,
+    new_marked_as_correct bool
+)
+    RETURNS get_answer_result
+AS
+$$
+DECLARE
+    v_question_id int;
+BEGIN
+    -- check if answer exists
+    SELECT question INTO v_question_id FROM answers WHERE response_id = for_answer_id;
+
+    IF v_question_id IS NULL THEN
+        RAISE EXCEPTION 'Answer with id % does not exist. ERR_ANSWER_DOES_NOT_EXIST', for_answer_id;
+    END IF;
+
+    UPDATE answers a SET marked_as_correct = false, marked_as_correct_at = null WHERE a.question = v_question_id;
+
+    -- change correct answer
+    UPDATE answers
+    SET marked_as_correct    = new_marked_as_correct,
+        marked_as_correct_at = CASE WHEN new_marked_as_correct = false THEN null ELSE now() END
+    WHERE response_id = for_answer_id;
+
+    RETURN get_answer(for_answer_id);
+END;
+$$ LANGUAGE plpgsql;
+
+-- delete answer
+CREATE OR REPLACE FUNCTION delete_answer(
+    for_answer_id int
+)
+    RETURNS VOID
+AS
+$$
+BEGIN
+    -- check if answer exists
+    IF NOT EXISTS (SELECT 1 FROM answers WHERE response_id = for_answer_id) THEN
+        RAISE EXCEPTION 'Answer with id % does not exist. ERR_ANSWER_DOES_NOT_EXIST', for_answer_id;
+    END IF;
+
+    -- delete answer
+    DELETE FROM answers WHERE response_id = for_answer_id;
+
+    RETURN;
+END;
+$$ LANGUAGE plpgsql;
+
+-- edit answer
+CREATE OR REPLACE FUNCTION edit_answer(
+    edit_answer_id int,
+    new_text text,
+    new_media_ids int[]
+)
+    RETURNS get_answer_result
+AS
+$$
+DECLARE
+    _media_id int;
+BEGIN
+    -- Check if answer exists
+    IF NOT EXISTS (SELECT 1 FROM answers WHERE response_id = edit_answer_id) THEN
+        RAISE EXCEPTION 'Answer with id % does not exist. ERR_ANSWER_DOES_NOT_EXIST', edit_answer_id;
+    END IF;
+
+    -- Update the answers table
+    UPDATE answers
+    SET text = COALESCE(new_text, text)
+    WHERE response_id = edit_answer_id;
+
+    IF new_media_ids IS NOT NULL THEN
+        -- First, delete existing media for the answer
+        DELETE FROM answers_pictures WHERE response = edit_answer_id;
+
+        -- Then, insert new media
+        FOREACH _media_id IN ARRAY new_media_ids
+            LOOP
+                IF NOT EXISTS(SELECT 1 FROM media WHERE media_id = _media_id) THEN
+                    RAISE EXCEPTION 'Media with id % does not exist. ERR_MEDIA_DOES_NOT_EXIST', _media_id;
+                END IF;
+                INSERT INTO answers_pictures (media_id, response) VALUES (_media_id, edit_answer_id);
+            END LOOP;
+    END IF;
+    RETURN get_answer(edit_answer_id);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION get_answers_for_question(
+    for_question_id int
+)
+    RETURNS SETOF get_answer_result
+AS
+$$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM questions WHERE question_id = for_question_id) THEN
+        RAISE EXCEPTION 'Question with id % does not exist. ERR_QUESTION_DOES_NOT_EXIST', for_question_id;
+    END IF;
+    RETURN QUERY SELECT gqr.*
+                 FROM answers a
+                          JOIN LATERAL get_answer(a.response_id) AS gqr ON true
+                 WHERE a.question = for_question_id;
+end;
+$$ LANGUAGE plpgsql;
+
+-- comments
+CREATE OR REPLACE FUNCTION get_comment(
+    for_comment_id int
+)
+    RETURNS get_comment_result
+AS
+$$
+DECLARE
+    _comment_id          int;
+    _user_id             int;
+    _reply_to_answer_id  int;
+    _reply_to_comment_id int;
+    _created_at          timestamp;
+    _text                text;
+BEGIN
+    -- check if comment exists
+    IF NOT EXISTS (SELECT 1 FROM comments WHERE comment_id = for_comment_id) THEN
+        RAISE EXCEPTION 'Comment with id % does not exist. ERR_COMMENT_DOES_NOT_EXIST', for_comment_id;
+    END IF;
+
+    SELECT c.comment_id, c.user_id, c.reply_to_answer, c.reply_to_comment, c.created_at, c.text
+    INTO _comment_id, _user_id, _reply_to_answer_id, _reply_to_comment_id, _created_at, _text
+    FROM comments c
+    WHERE c.comment_id = for_comment_id;
+
+    RETURN (_comment_id, _user_id, _reply_to_answer_id, _reply_to_comment_id, _created_at, _text)::get_comment_result;
+END;
+$$ LANGUAGE plpgsql;
+
+-- create comment
+CREATE OR REPLACE FUNCTION create_comment(
+    new_text text,
+    new_created_by int,
+    new_reply_to_answer_id int,
+    new_reply_to_comment_id int
+)
+    RETURNS get_comment_result
+AS
+$$
+DECLARE
+    _comment_id int;
+BEGIN
+    -- check if answer exists
+    IF NOT EXISTS (SELECT 1 FROM answers WHERE response_id = new_reply_to_answer_id) THEN
+        RAISE EXCEPTION 'Answer with id % does not exist. ERR_ANSWER_DOES_NOT_EXIST', new_reply_to_answer_id;
+    END IF;
+
+    -- check if comment exists
+    IF new_reply_to_comment_id IS NOT NULL AND
+       NOT EXISTS (SELECT 1 FROM comments WHERE comment_id = new_reply_to_comment_id) THEN
+        RAISE EXCEPTION 'Comment with id % does not exist. ERR_COMMENT_DOES_NOT_EXIST', new_reply_to_comment_id;
+    END IF;
+
+    -- Insert the new comment and get its ID
+    INSERT INTO comments (text, user_id, reply_to_answer, reply_to_comment)
+    VALUES (new_text, new_created_by, new_reply_to_answer_id, new_reply_to_comment_id)
+    RETURNING comment_id INTO _comment_id;
+
+    -- Return all relevant fields
+    RETURN get_comment(_comment_id);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION get_comments_by_answer(
+    for_answer_id int
+)
+RETURNS SETOF get_comment_result
+AS
+$$
+begin
+    IF NOT EXISTS (SELECT 1 FROM answers WHERE response_id = for_answer_id) THEN
+        RAISE EXCEPTION 'Answer with id % does not exist. ERR_ANSWER_DOES_NOT_EXIST', for_answer_id;
+    END IF;
+
+    RETURN QUERY SELECT gqr.*
+                 FROM comments a
+                          JOIN LATERAL get_comment(a.comment_id) AS gqr ON true
+                 WHERE a.reply_to_answer = for_answer_id;
+end;
+$$ LANGUAGE plpgsql;
+
+-- delete comment
+CREATE OR REPLACE FUNCTION delete_comment(
+    for_comment_id int
+)
+    RETURNS VOID
+AS
+$$
+BEGIN
+    -- check if comment exists
+    IF NOT EXISTS (SELECT 1 FROM comments WHERE comment_id = for_comment_id) THEN
+        RAISE EXCEPTION 'Comment with id % does not exist. ERR_COMMENT_DOES_NOT_EXIST', for_comment_id;
+    END IF;
+
+    -- delete comment
+    DELETE FROM comments WHERE comment_id = for_comment_id;
+
+    RETURN;
+END;
+$$ LANGUAGE plpgsql;
+
+-- edit comment
+CREATE OR REPLACE FUNCTION edit_comment(
+    edit_comment_id int,
+    new_text text
+)
+    RETURNS get_comment_result
+AS
+$$
+BEGIN
+    -- Check if comment exists
+    IF NOT EXISTS (SELECT 1 FROM comments WHERE comment_id = edit_comment_id) THEN
+        RAISE EXCEPTION 'Comment with id % does not exist. ERR_COMMENT_DOES_NOT_EXIST', edit_comment_id;
+    END IF;
+
+    -- Update the comments table
+    UPDATE comments
+    SET text = COALESCE(new_text, text)
+    WHERE comment_id = edit_comment_id;
+
+    RETURN get_comment(edit_comment_id);
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- tags
+CREATE OR REPLACE FUNCTION delete_tag(
+    for_tag_id int
+)
+    RETURNS VOID
+AS
+$$
+BEGIN
+    -- check if tag exists
+    IF NOT EXISTS (SELECT 1 FROM tags WHERE tag_id = for_tag_id) THEN
+        RAISE EXCEPTION 'Tag with id % does not exist. ERR_TAG_DOES_NOT_EXIST', for_tag_id;
+    END IF;
+
+    -- delete tag
+    DELETE FROM tags WHERE tag_id = for_tag_id;
+
+    RETURN;
+END;
+$$ LANGUAGE plpgsql;
+
+-- agreements
+
+CREATE OR REPLACE FUNCTION create_agreement(
+    new_text text
+)
+    RETURNS int
+AS
+$$
+DECLARE
+    n_agreement_id int;
+BEGIN
+    -- Insert the new agreement and get its ID
+    INSERT INTO agreements (agreement_text)
+    VALUES (new_text)
+    RETURNING agreement_id INTO n_agreement_id;
+
+    -- Return all relevant fields
+    RETURN n_agreement_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- subjects
+CREATE OR REPLACE FUNCTION create_subject(
+    new_subject varchar(100)
+)
+    RETURNS int
+AS
+$$
+DECLARE
+    n_subject_id int;
+BEGIN
+    IF EXISTS(SELECT 1 FROM subjects WHERE subject = new_subject) THEN
+        RAISE EXCEPTION 'Subject % already exists. ERR_SUBJECT_ALREADY_EXISTS', new_subject;
+    END IF;
+
+    -- Insert the new subject and get its ID
+    INSERT INTO subjects (subject)
+    VALUES (new_subject)
+    RETURNING subject_id INTO n_subject_id;
+
+    -- Return all relevant fields
+    RETURN n_subject_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- delete subject
+CREATE OR REPLACE FUNCTION delete_subject(
+    for_subject_id int
+)
+    RETURNS VOID
+AS
+$$
+BEGIN
+    -- check if subject exists
+    IF NOT EXISTS (SELECT 1 FROM subjects WHERE subject_id = for_subject_id) THEN
+        RAISE EXCEPTION 'Subject with id % does not exist. ERR_SUBJECT_DOES_NOT_EXIST', for_subject_id;
+    END IF;
+
+    -- delete subject
+    DELETE FROM subjects WHERE subject_id = for_subject_id;
+
+    RETURN;
+END;
+$$ LANGUAGE plpgsql;
+
+-- edit subject
+CREATE OR REPLACE FUNCTION edit_subject(
+    edit_subject_id int,
+    new_subject varchar(100)
+)
+    RETURNS VOID
+AS
+$$
+BEGIN
+    -- Check if subject exists
+    IF NOT EXISTS (SELECT 1 FROM subjects WHERE subject_id = edit_subject_id) THEN
+        RAISE EXCEPTION 'Subject with id % does not exist. ERR_SUBJECT_DOES_NOT_EXIST', edit_subject_id;
+    END IF;
+
+    -- Update the subjects table
+    UPDATE subjects
+    SET subject = COALESCE(new_subject, subject)
+    WHERE subject_id = edit_subject_id;
+
+    RETURN;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION update_agreement(
+    existing_agreement_id int,
+    new_text text,
+    new_created_at timestamp
+)
+    RETURNS VOID
+AS
+$$
+begin
+    IF EXISTS (SELECT 1 FROM agreements WHERE agreement_id = existing_agreement_id) THEN
+        UPDATE agreements
+        SET agreement_text = new_text, created_at = new_created_at
+        WHERE agreement_id = existing_agreement_id;
+    ELSE
+        RAISE EXCEPTION 'Agreement with id % does not exist. ERR_AGREEMENT_DOES_NOT_EXIST', existing_agreement_id;
+    END IF;
+
+    RETURN;
+end;
+$$ language plpgsql;
